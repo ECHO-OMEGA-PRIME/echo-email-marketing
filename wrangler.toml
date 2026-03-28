@@ -1,0 +1,27 @@
+name = "echo-email-marketing"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-email-marketing"
+database_id = "ed901865-42db-4f17-b904-e76e75166ab7"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "96fc2423f2024f1fa031384cb97e9a3e"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
