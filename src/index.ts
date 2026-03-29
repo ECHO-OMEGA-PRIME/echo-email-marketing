@@ -121,7 +121,7 @@ async function rateLimit(env: Env, key: string, max: number, windowSec = 60): Pr
 // Auth
 app.use('*', async (c, next) => {
   const path = c.req.path;
-  if (path === '/health' || path === '/status' || path.startsWith('/track/') || path.startsWith('/unsubscribe/') || path === '/webhooks/stripe') return next();
+  if (path === '/health' || path === '/status' || path === '/subscribe' || path.startsWith('/track/') || path.startsWith('/unsubscribe/') || path === '/webhooks/stripe') return next();
   if (c.req.method === 'GET') return next();
   const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
   if (!key || key !== c.env.ECHO_API_KEY) return json(c, { error: 'Unauthorized' }, 401);
@@ -142,6 +142,46 @@ app.use('*', async (c, next) => {
 app.get('/', (c) => json(c, { service: 'echo-email-marketing', version: '2.0.0', status: 'operational' }));
 app.get('/health', (c) => json(c, { status: 'ok', service: 'echo-email-marketing', version: '2.0.0', timestamp: new Date().toISOString(), stripe: !!c.env.STRIPE_SECRET_KEY, plans: Object.keys(PLAN_LIMITS) }));
 app.get('/status', (c) => json(c, { status: 'operational', service: 'echo-email-marketing', version: '2.0.0' }));
+
+// === PUBLIC SUBSCRIBE (no auth — for website signup forms) ===
+app.post('/subscribe', async (c) => {
+  const b = sanitizeBody(await c.req.json()) as any;
+  const email = sanitize(b.email || '', 320).trim().toLowerCase();
+  if (!email || !email.includes('@') || !email.includes('.')) return json(c, { error: 'Invalid email' }, 400);
+  const tenantId = sanitize(b.tenant_id || '', 100);
+  const listId = sanitize(b.list_id || '', 100);
+  if (!tenantId) return json(c, { error: 'tenant_id required' }, 400);
+  // Rate limit: 5 subscribe attempts per IP per 5 minutes
+  const ip = c.req.header('CF-Connecting-IP') || 'unknown';
+  if (!await rateLimit(c.env, `subscribe:${ip}`, 5, 300)) return json(c, { error: 'Too many attempts — try again later' }, 429);
+  // Check tenant exists
+  const tenant = await c.env.DB.prepare('SELECT id, max_contacts FROM tenants WHERE id=?').bind(tenantId).first<any>();
+  if (!tenant) return json(c, { error: 'Invalid tenant' }, 400);
+  // Check contact limit
+  const cnt = await c.env.DB.prepare('SELECT COUNT(*) as c FROM contacts WHERE tenant_id=?').bind(tenantId).first<any>();
+  if (cnt && cnt.c >= tenant.max_contacts) return json(c, { error: 'List is full' }, 403);
+  // Upsert contact (don't fail on duplicate email)
+  let contactId: string;
+  const existing = await c.env.DB.prepare('SELECT id FROM contacts WHERE tenant_id=? AND email=?').bind(tenantId, email).first<any>();
+  if (existing) {
+    contactId = existing.id;
+  } else {
+    contactId = uid();
+    const tags = JSON.stringify(b.tags ? (typeof b.tags === 'string' ? b.tags.split(',').map((t: string) => t.trim()) : b.tags) : ['newsletter']);
+    await c.env.DB.prepare('INSERT INTO contacts (id,tenant_id,email,first_name,last_name,tags,custom_fields) VALUES (?,?,?,?,?,?,?)')
+      .bind(contactId, tenantId, email, sanitize(b.name || b.first_name || '', 200) || null, sanitize(b.last_name || '', 200) || null, tags, JSON.stringify({ source: sanitize(b.source || 'website', 100) }))
+      .run();
+    slog('info', 'New subscriber', { email, tenant_id: tenantId, source: b.source });
+  }
+  // Add to list if specified
+  if (listId) {
+    try {
+      await c.env.DB.prepare('INSERT OR IGNORE INTO list_members (id,list_id,contact_id) VALUES (?,?,?)').bind(uid(), listId, contactId).run();
+      await c.env.DB.prepare('UPDATE lists SET contact_count=(SELECT COUNT(*) FROM list_members WHERE list_id=?) WHERE id=?').bind(listId, listId).run();
+    } catch {}
+  }
+  return json(c, { ok: true, id: contactId }, 201);
+});
 
 // === TENANTS ===
 app.post('/tenants', async (c) => {
